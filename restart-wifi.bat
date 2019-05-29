@@ -27,7 +27,7 @@ timeout /t 2 >nul
 netsh interface set interface "Wi-Fi" ENABLED
 timeout /t 15 >nul
 :: Check if connection up
-WMIC /node: "TJ-HotRod" path WIN32_NetworkAdapter where (NetConnectionID="Wi-Fi") get NetConnectionStatus | find /c "2" >NUL
+wmic path WIN32_NetworkAdapter where (NetConnectionID="Wi-Fi") get NetConnectionStatus | find /c "2" >NUL
 if %ERRORLEVEL% EQU 0 ( 
     echo %TIME:~0,-1% ^| Link back up
     timeout /t 2 >nul
