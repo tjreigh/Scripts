@@ -6,6 +6,9 @@
 ::==============================================================================
 @setlocal enableextensions enabledelayedexpansion
 @echo off
+:: Rezise console window
+mode con: lines=36
+mode con: cols=27
 
 :loop
 :: State detection loop - just pings google
