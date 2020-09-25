@@ -1,0 +1,3 @@
+symlink-gen/__pycache__/*
+symlink-gen/build/*
+symlink-gen/dist/*
