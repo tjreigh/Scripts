@@ -161,21 +161,85 @@ def limit_warn_color(projected_pct):
         return WARN_LIME
     return WARN_GREEN
 
-MIN_ELAPSED_FRAC = 0.02
+STATE_FILE = os.path.expanduser('~/.claude/.statusline_burn_state.json')
+ROLLING_LOOKBACK_SECS = {
+    'five_hour': 15 * 60,       # smooth over the last 15 min of actual usage
+    'seven_day': 6 * 3600,      # smooth over the last 6 hours of actual usage
+}
+MIN_SAMPLE_SPAN_SECS = 60       # need at least this much real spread before trusting a slope
+MAX_SAMPLES = 500
+CONFIDENCE_RAMP_FRAC = 0.20     # fraction of the window needed to fully trust a projection
 
-def limit_color(pct, secs_left, window_secs):
-    """Burn-rate-aware color for a rate-limit window: projects current usage
-    forward to reset time so a high % with lots of time left reads as more
-    urgent than the same % right before it resets anyway.
+def load_state():
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    elapsed_frac is floored (not cut off) at MIN_ELAPSED_FRAC so a fast burn
-    in the opening minutes of a window still projects and escalates color,
-    instead of hiding behind raw pct until 5% of the window has passed. The
-    floor only exists to keep pct/elapsed_frac from dividing by ~0."""
+def save_state(state):
+    try:
+        tmp = STATE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+def update_samples(state, key, reset_at, now, pct, lookback_secs):
+    """Append the current sample to a rolling per-window history, dropping
+    anything older than lookback_secs and anything from a previous window
+    (detected via a changed reset_at) so a fresh window starts with no
+    borrowed history from the one that just ended."""
+    entry = state.get(key)
+    if not isinstance(entry, dict) or entry.get('reset_at') != reset_at:
+        entry = {'reset_at': reset_at, 'samples': []}
+    samples = entry.get('samples', [])
+    samples.append([now, pct])
+    cutoff = now - lookback_secs
+    samples = [s for s in samples if isinstance(s, list) and len(s) == 2 and s[0] >= cutoff]
+    if len(samples) > MAX_SAMPLES:
+        samples = samples[-MAX_SAMPLES:]
+    entry['samples'] = samples
+    state[key] = entry
+    return samples
+
+def burn_rate_color(samples, pct, secs_left, window_secs):
+    """Burn-rate-aware color using an actual rolling average rate of usage
+    (least-squares slope over recent samples), not a naive projection from
+    window start. That naive version divided by a floored elapsed-fraction,
+    which massively overstated the burn rate in the first few minutes of a
+    window. Here, until enough real history/spread has accumulated, we just
+    show the raw pct's color instead of guessing at a rate.
+
+    The slope itself is still only ever measured over a short rolling
+    lookback (minutes, not hours), so extrapolating it all the way to reset
+    is a huge multiplier early in the window -- a brief burst right after
+    reset (e.g. session setup) reads as if it'll sustain for the next several
+    hours. confidence ramps the projected *excess* up from 0 to 1 as real
+    elapsed time (not just sample span) approaches CONFIDENCE_RAMP_FRAC of
+    the window, so early bursts are damped but a rate that's still elevated
+    once a real chunk of the window has passed gets flagged at full strength."""
     if secs_left is None or secs_left <= 0:
         return WARN_GREEN
-    elapsed_frac = max(MIN_ELAPSED_FRAC, min(1.0, (window_secs - secs_left) / window_secs))
-    projected = pct / elapsed_frac
+    if len(samples) < 2:
+        return limit_warn_color(pct)
+    ts = [s[0] for s in samples]
+    ps = [s[1] for s in samples]
+    span = ts[-1] - ts[0]
+    if span < MIN_SAMPLE_SPAN_SECS:
+        return limit_warn_color(pct)
+    n = len(ts)
+    t_mean = sum(ts) / n
+    p_mean = sum(ps) / n
+    num = sum((t - t_mean) * (p - p_mean) for t, p in zip(ts, ps))
+    den = sum((t - t_mean) ** 2 for t in ts)
+    if den == 0:
+        return limit_warn_color(pct)
+    slope = max(0.0, num / den)  # pct per second, clamped to non-negative
+    elapsed = max(0.0, window_secs - secs_left)
+    confidence = min(1.0, elapsed / (window_secs * CONFIDENCE_RAMP_FRAC))
+    projected = pct + slope * secs_left * confidence
     return limit_warn_color(projected)
 
 try:
@@ -303,10 +367,13 @@ SEVEN_DAY_SECS = 7 * 24 * 3600
 
 if five_pct:
     try:
-        now  = int(time.time())
+        now   = int(time.time())
+        state = load_state()
+
         pct5 = round(float(five_pct))
         secs_left5 = int(five_reset) - now if five_reset else None
-        five_color = limit_color(pct5, secs_left5, FIVE_HOUR_SECS)
+        samples5 = update_samples(state, 'five_hour', five_reset, now, pct5, ROLLING_LOOKBACK_SECS['five_hour'])
+        five_color = burn_rate_color(samples5, pct5, secs_left5, FIVE_HOUR_SECS)
         if five_reset:
             five_cell = f'{five_color}5h {pct5}% (resets in {fmt_reset(secs_left5)}){RESET}'
         else:
@@ -316,12 +383,14 @@ if five_pct:
         if seven_pct:
             pct7 = round(float(seven_pct))
             secs_left7 = int(seven_reset) - now if seven_reset else None
-            seven_color = limit_color(pct7, secs_left7, SEVEN_DAY_SECS)
+            samples7 = update_samples(state, 'seven_day', seven_reset, now, pct7, ROLLING_LOOKBACK_SECS['seven_day'])
+            seven_color = burn_rate_color(samples7, pct7, secs_left7, SEVEN_DAY_SECS)
             if seven_reset:
                 seven_cell = f'{seven_color}7d {pct7}% (resets in {fmt_reset(secs_left7)}){RESET}'
             else:
                 seven_cell = f'{seven_color}7d {pct7}%{RESET}'
 
+        save_state(state)
         print(row('limit', [five_cell, seven_cell]))
     except Exception:
         pass
